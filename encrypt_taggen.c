@@ -21,26 +21,53 @@
 static void hex(const unsigned char *b, size_t n){ for(size_t i=0;i<n;i++) printf("%02x", b[i]); }
 static void sha256(const unsigned char *m, size_t n, unsigned char out[32]){ SHA256(m, n, out); }
 static void xorb(unsigned char *o, const unsigned char *a, const unsigned char *b, size_t n){ for(size_t i=0;i<n;i++) o[i]=a[i]^b[i]; }
-
+/**
+ * Parameters:
+ *  - pt:       Pointer to plaintext buffer.
+ *  - ptlen:    Length of plaintext in bytes.
+ *  - key:      256-bit AES encryption key (32 bytes).
+ *  - iv:       Buffer to store generated 12-byte Initialization Vector (IV).
+ *  - out_ct:   Output pointer to ciphertext (allocated inside).
+ *  - out_ct_len: Output ciphertext length (set inside).
+ *  - tag:      Buffer to store 16-byte authentication tag (used for integrity verification).
+ */
 static int aes_gcm_encrypt(const unsigned char *pt, int ptlen,
                            const unsigned char *key,
                            unsigned char iv[GCM_IV_LEN],
                            unsigned char **out_ct, int *out_ct_len,
                            unsigned char tag[GCM_TAG_LEN]){
+    //    Generate a random IV (Initialization Vector) for AES-GCM.
+    //    Each encryption must use a unique IV to maintain security.
     RAND_bytes(iv, GCM_IV_LEN);
+
+     //   Create a new cipher context to hold AES-GCM state.
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if(!ctx) return 0;
+    if(!ctx) return 0;  // if context allocation fails → abort.
+
+    //    Variables for status and lengths.
     int ok = 1, len=0, ctlen=0;
+    //    Allocate buffer for ciphertext (same length as plaintext).
     unsigned char *ct = malloc(ptlen);
+    //    Initialize AES-GCM mode (256-bit key length).
+    //    EVP_aes_256_gcm() → selects AES cipher with 256-bit key in GCM mode.
     if(!EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) ok=0;
+    //    Specify IV length (GCM allows variable IV, usually 12 bytes).
     if(ok && !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL)) ok=0;
+    //    Provide the encryption key and IV to the context.
     if(ok && !EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv)) ok=0;
+    //    Encrypt the plaintext → produce ciphertext.
+    //    EVP_EncryptUpdate() can be called multiple times for streaming.
     if(ok && !EVP_EncryptUpdate(ctx, ct, &len, pt, ptlen)) ok=0;
     ctlen = len;
+    //    Finalize encryption. (For GCM, this doesn't add padding.)
+    //    Some data may still be buffered, so finalize to flush it out.                      
     if(ok && !EVP_EncryptFinal_ex(ctx, ct+len, &len)) ok=0;
-    ctlen += len;
+    ctlen += len;  
+    //    Retrieve authentication tag (used for verifying data integrity).
+    //    Tag must be sent/stored along with ciphertext for decryption.
     if(ok && !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag)) ok=0;
-    EVP_CIPHER_CTX_free(ctx);
+    EVP_CIPHER_CTX_free(ctx); //  Free the encryption context to avoid memory leaks.      
+    //    If any step failed, release allocated memory and return 0.                  
     if(!ok){ free(ct); return 0; }
     *out_ct = ct; *out_ct_len = ctlen; return 1;
 }
