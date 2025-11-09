@@ -1,12 +1,12 @@
-// sma_verify.c
+// verify_audit.c
 // Phase: Verify / Audit (Algorithm 2: SMA) demo using OpenSSL on P-256
 // Ryu's project — Industry 5.0 healthcare framework
 
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 #include <stdlib.h>
-
+#include <time.h>
+#include <sys/time.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/rand.h>
@@ -14,22 +14,28 @@
 #include <openssl/ec.h>
 #include <openssl/obj_mac.h>
 
+#define CHECK(x) do { if(!(x)) { fprintf(stderr,"[ERR] %s failed @%s:%d\n", #x, __FILE__, __LINE__); goto cleanup_fail; } } while(0)
+
 static void print_hex(const char *label, const unsigned char *buf, size_t len){
     printf("%s", label);
     for(size_t i=0;i<len;i++) printf("%02x", buf[i]);
     printf("\n");
 }
-
 static void sha256(const unsigned char *in, size_t inlen, unsigned char out32[32]){
     SHA256(in, inlen, out32);
 }
+static void print_bn(const char *label, const BIGNUM *bn){
+    char *hex = BN_bn2hex(bn);
+    if(hex){ printf("%s%s\n", label, hex); OPENSSL_free(hex); }
+    else   { printf("%s<null>\n", label); }
+}
 
-// concat helper
 static unsigned char* cat2(const unsigned char *a, size_t la,
                            const unsigned char *b, size_t lb,
                            size_t *outlen){
     *outlen = la + lb;
     unsigned char *m = (unsigned char*)malloc(*outlen);
+    if(!m) return NULL;
     memcpy(m, a, la);
     memcpy(m+la, b, lb);
     return m;
@@ -39,6 +45,7 @@ static unsigned char* cat3(const unsigned char *a, size_t la,
                            const unsigned char *c, size_t lc,
                            size_t *outlen){
     size_t t; unsigned char *ab = cat2(a,la,b,lb,&t);
+    if(!ab) return NULL;
     unsigned char *abc = cat2(ab,t,c,lc,outlen);
     free(ab);
     return abc;
@@ -49,9 +56,9 @@ static unsigned char* cat5(const unsigned char *a, size_t la,
                            const unsigned char *d, size_t ld,
                            const unsigned char *e, size_t le,
                            size_t *outlen){
-    size_t t1; unsigned char *ab = cat2(a,la,b,lb,&t1);
-    size_t t2; unsigned char *abc = cat2(ab,t1,c,lc,&t2);
-    size_t t3; unsigned char *abcd = cat2(abc,t2,d,ld,&t3);
+    size_t t1; unsigned char *ab   = cat2(a,la,b,lb,&t1);             if(!ab) return NULL;
+    size_t t2; unsigned char *abc  = cat2(ab,t1,c,lc,&t2);            if(!abc){ free(ab); return NULL; }
+    size_t t3; unsigned char *abcd = cat2(abc,t2,d,ld,&t3);           if(!abcd){ free(ab); free(abc); return NULL; }
     unsigned char *abcde = cat2(abcd,t3,e,le,outlen);
     free(ab); free(abc); free(abcd);
     return abcde;
@@ -66,173 +73,217 @@ static int point_to_bytes(const EC_GROUP *grp, const EC_POINT *P, unsigned char 
 // map SHA256 -> BIGNUM mod curve order
 static int hash_to_bn_mod_n(const unsigned char *msg, size_t len,
                             const BIGNUM *order, BIGNUM **out_bn){
-    unsigned char h[32]; sha256(msg, len, h);
+    unsigned char h[32];
+    sha256(msg, len, h);
+
     BIGNUM *x = BN_bin2bn(h, 32, NULL);
     if(!x) return 0;
-    if(!BN_mod(x, x, order, NULL)){ BN_free(x); return 0; }
-    *out_bn = x; return 1;
+
+    BN_CTX *ctx = BN_CTX_new();
+    if(!ctx){ BN_free(x); return 0; }
+
+    if(!BN_mod(x, x, order, ctx)){
+        BN_free(x);
+        BN_CTX_free(ctx);
+        return 0;
+    }
+    BN_CTX_free(ctx);
+    *out_bn = x;
+    return 1;
+}
+
+// wall-clock ms
+static long long now_ms(void){
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec*1000LL + tv.tv_usec/1000LL;
 }
 
 int main(void){
-    /* ----- Common parameters ----- */
-    const char *IDu = "owner:doctor.alice";       // Owner identity
-    const char *Pu  = "S3curePa$$w0rd!";          // Owner password (for SP_u derivation demo)
-    const char *IDR = "requester:bob";            // Requester identity (input of Algorithm 2)
-    const long  deltaT_ms = 60*1000;              // freshness window ΔT (1 min)
+    const char *IDu = "owner:doctor.alice";
+    const char *Pu  = "S3curePa$$w0rd!";
+    const char *IDR = "requester:bob";
+    const long  deltaT_ms = 60*1000; // 1 minute
 
-    /* Setup P-256 */
-    EC_GROUP *grp = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
-    const EC_POINT *G = EC_GROUP_get0_generator(grp);
-    BIGNUM *order = BN_new(); EC_GROUP_get_order(grp, order, NULL);
+    int ret = 1;
+    BN_CTX *bnctx = NULL;
+    EC_GROUP *grp = NULL;
+    EC_KEY *owner = NULL, *req = NULL;
+    BIGNUM *order = NULL, *nR = NULL, *sigma = NULL, *C = NULL, *Cstar = NULL;
+    EC_POINT *P_R = NULL, *sigG = NULL, *CpkU = NULL, *lhs = NULL, *left = NULL, *right = NULL;
 
-    /* Generate Owner long-term key (sk_u, pk_u) */
-    EC_KEY *owner = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
-    EC_KEY_generate_key(owner);
-    const BIGNUM *sk_u = EC_KEY_get0_private_key(owner);              // owner secret
-    const EC_POINT *pk_u = EC_KEY_get0_public_key(owner);             // owner public
+    long long T_total0 = now_ms();
 
-    /* Derive SP_u (from paper Eq. (3): P_u = H(ID_u || P_u || n1))
-       Here we just recompute a sample SP_u for hashing in SID_R */
+    // === Setup curve/order ===
+    grp = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);                       CHECK(grp);
+    order = BN_new();                                                              CHECK(order);
+    CHECK(EC_GROUP_get_order(grp, order, NULL));
+    bnctx = BN_CTX_new();                                                          CHECK(bnctx);
+
+    // === Owner keys ===
+    owner = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);                        CHECK(owner);
+    CHECK(EC_KEY_generate_key(owner));
+    const BIGNUM  *sk_u = EC_KEY_get0_private_key(owner);                          CHECK(sk_u);
+    const EC_POINT*pk_u = EC_KEY_get0_public_key(owner);                           CHECK(pk_u);
+
+    // === Derive SPu (demo) ===
     unsigned char n1[32], n2[32];
-    RAND_bytes(n1,32); RAND_bytes(n2,32);
-    size_t l1; unsigned char *id_pw = cat2((const unsigned char*)IDu, strlen(IDu),
-                                           (const unsigned char*)Pu,  strlen(Pu), &l1);
-    size_t l2; unsigned char *id_pw_n1 = cat2(id_pw,l1,n1,32,&l2);
+    CHECK(RAND_bytes(n1,32)==1 && RAND_bytes(n2,32)==1);
+    size_t l1=0, l2=0;
+    unsigned char *id_pw    = cat2((const unsigned char*)IDu, strlen(IDu),
+                                   (const unsigned char*)Pu,  strlen(Pu), &l1);    CHECK(id_pw);
+    unsigned char *id_pw_n1 = cat2(id_pw,l1,n1,32,&l2);                            CHECK(id_pw_n1);
     unsigned char SPu[32]; sha256(id_pw_n1, l2, SPu);
     free(id_pw); free(id_pw_n1);
 
-    /* ----- Requester side (lines 3–10 in the algorithm) ----- */
-    // Step 3: Generate nonce n_R ∈ Z_p*
-    BIGNUM *nR = BN_new(); BN_rand_range(nR, order);
+    // -------------------------------------------
+    // Requester Phase
+    // -------------------------------------------
+    long long T_req0 = now_ms();
 
-    // Step 4–5:
-    // SP_IDR = H(ID_R || P_R || n1) -- but requires P_R so we do P_R first
-    // P_R = n_R * g
-    EC_POINT *P_R = EC_POINT_new(grp);
-    EC_POINT_mul(grp, P_R, nR, NULL, NULL, NULL); // P_R = nR*G
+    nR = BN_new();                                                                  CHECK(nR);
+    do { CHECK(BN_rand_range(nR, order)); } while(BN_is_zero(nR));                 // nR in [1,n-1]
+    P_R = EC_POINT_new(grp);                                                       CHECK(P_R);
+    CHECK(EC_POINT_mul(grp, P_R, nR, NULL, NULL, bnctx));
 
-    unsigned char PR_ser[33]; point_to_bytes(grp, P_R, PR_ser);
+    unsigned char PR_ser[33];                                                      CHECK(point_to_bytes(grp, P_R, PR_ser));
 
-    size_t l_spidr_msg; unsigned char *spidr_msg =
-        cat3((const unsigned char*)IDR, strlen(IDR), PR_ser, 33, n1, 32, &l_spidr_msg);
+    size_t l_spidr_msg=0;
+    unsigned char *spidr_msg =
+        cat3((const unsigned char*)IDR, strlen(IDR), PR_ser, 33, n1, 32, &l_spidr_msg); CHECK(spidr_msg);
     unsigned char SP_IDR[32]; sha256(spidr_msg, l_spidr_msg, SP_IDR);
     free(spidr_msg);
 
-    // SID_R = H(ID_u || SP_u || P_R || n1 || n2)
-    size_t l_sid_msg;
+    size_t l_sid_msg=0;
     unsigned char *sid_msg = cat5((const unsigned char*)IDu, strlen(IDu),
-                                  SPu, 32,
-                                  PR_ser, 33,
-                                  n1, 32,
-                                  n2, 32, &l_sid_msg);
+                                  SPu, 32, PR_ser, 33, n1, 32, n2, 32, &l_sid_msg);     CHECK(sid_msg);
     unsigned char SIDR[32]; sha256(sid_msg, l_sid_msg, SIDR);
     free(sid_msg);
 
-    // C = H(P_R || SID_R || pk_u || T1)
-    // serialize pk_u
-    unsigned char PKU_ser[33]; point_to_bytes(grp, pk_u, PKU_ser);
-    // T1 (timestamp, ms since epoch)
-    long long T1_ms = (long long)(clock()) * 1000 / CLOCKS_PER_SEC; // demo timer (process-time)
-    // For real system use wall-clock epoch (e.g., gettimeofday)
-    unsigned char T1_buf[16]; // put T1_ms as bytes
-    for(int i=0;i<16;i++){ T1_buf[15-i] = (unsigned char)((T1_ms >> (i*8)) & 0xff); }
+    unsigned char PKU_ser[33];                                                     CHECK(point_to_bytes(grp, pk_u, PKU_ser));
 
-    size_t l_cmsg1; unsigned char *cmsg1 = cat2(PR_ser,33,SIDR,32,&l_cmsg1);
-    size_t l_cmsg2; unsigned char *cmsg2 = cat2(PKU_ser,33,T1_buf,16,&l_cmsg2);
-    size_t l_cmsg;  unsigned char *cmsg  = cat2(cmsg1,l_cmsg1,cmsg2,l_cmsg2,&l_cmsg);
+    long long T1_ms = now_ms();
+    unsigned char T1_buf[16];
+    for(int i=0;i<16;i++) T1_buf[15-i] = (unsigned char)((T1_ms >> (i*8)) & 0xff);
+
+    size_t l_cmsg1=0, l_cmsg2=0, l_cmsg=0;
+    unsigned char *cmsg1 = cat2(PR_ser,33,SIDR,32,&l_cmsg1);                       CHECK(cmsg1);
+    unsigned char *cmsg2 = cat2(PKU_ser,33,T1_buf,16,&l_cmsg2);                    CHECK(cmsg2);
+    unsigned char *cmsg  = cat2(cmsg1,l_cmsg1,cmsg2,l_cmsg2,&l_cmsg);              CHECK(cmsg);
     unsigned char C_hash[32]; sha256(cmsg, l_cmsg, C_hash);
     free(cmsg1); free(cmsg2); free(cmsg);
 
-    // Map C_hash to scalar mod n
-    BIGNUM *C = NULL; hash_to_bn_mod_n(C_hash, 32, order, &C);
+    CHECK(hash_to_bn_mod_n(C_hash, 32, order, &C));
 
-    // Prepare requester static secret sk_R (can be long-term); demo generate one
-    EC_KEY *req = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
-    EC_KEY_generate_key(req);
-    const BIGNUM *sk_R = EC_KEY_get0_private_key(req);
+    req = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);                           CHECK(req);
+    CHECK(EC_KEY_generate_key(req));
+    const BIGNUM *sk_R = EC_KEY_get0_private_key(req);                              CHECK(sk_R);
 
-    // σ = n_R + C * sk_R (mod n)
-    BIGNUM *sigma = BN_new();
-    BN_CTX *bnctx = BN_CTX_new();
-    BN_mod_mul(sigma, C, sk_R, order, bnctx);   // σ = C*sk_R
-    BN_mod_add(sigma, sigma, nR, order, bnctx); // σ = nR + C*sk_R
+    sigma = BN_new();                                                               CHECK(sigma);
+    CHECK(BN_mod_mul(sigma, C, sk_R, order, bnctx));
+    CHECK(BN_mod_add(sigma, sigma, nR, order, bnctx));
 
-    // “Send” (ID_R, P_R, C, σ, T1) to Owner
-    // (We already have them in memory)
+    long long T_req1 = now_ms();
 
-    /* ----- Owner side verification (lines 11–16) ----- */
+    // Debug dump — Requester
+    printf("\n=== [Requester Phase] ===\n");
+    print_bn("n_R: ", nR);
+    print_hex("SID_R: ", SIDR, 32);
+    print_hex("C_hash: ", C_hash, 32);
+    print_bn("sigma: ", sigma);
+    print_hex("P_R (compressed): ", PR_ser, 33);
+    printf("⏱️ Requester time: %lld ms\n", (T_req1 - T_req0));
 
-    // 1) Freshness: verify T_current − T1 < ΔT
-    long long Tcurrent_ms = (long long)(clock()) * 1000 / CLOCKS_PER_SEC; // demo timer
+    const EC_POINT *pk_R = EC_KEY_get0_public_key(req);
+
+
+    // -------------------------------------------
+    // Owner Verify Phase
+    // -------------------------------------------
+    long long T_vfy0 = now_ms();
+
+    long long Tcurrent_ms = now_ms();
     if((Tcurrent_ms - T1_ms) >= deltaT_ms){
         printf("[Owner] FAIL: timestamp not fresh (ΔT exceeded)\n");
         goto cleanup_fail;
     }
 
-    // 2) Recompute C* = H(P_R || SID_R || pk_u || T1)  (Owner has ID_u, SP_u, P_R, n1, n2)
-    // (we recompute SID_R as well)
-    size_t l_sid2;
-    unsigned char *sid2 = cat5((const unsigned char*)IDu, strlen(IDu),
-                               SPu, 32,
-                               PR_ser, 33,
-                               n1, 32,
-                               n2, 32, &l_sid2);
-    unsigned char SIDR2[32]; sha256(sid2, l_sid2, SIDR2);
-    free(sid2);
+    size_t l_sid2=0; unsigned char *sid2 = cat5((const unsigned char*)IDu, strlen(IDu),
+                                                SPu, 32, PR_ser, 33, n1, 32, n2, 32, &l_sid2); CHECK(sid2);
+    unsigned char SIDR2[32]; sha256(sid2, l_sid2, SIDR2); free(sid2);
 
-    size_t l_c2a; unsigned char *c2a = cat2(PR_ser,33,SIDR2,32,&l_c2a);
-    size_t l_c2b; unsigned char *c2b = cat2(PKU_ser,33,T1_buf,16,&l_c2b);
-    size_t l_c2;  unsigned char *c2  = cat2(c2a,l_c2a,c2b,l_c2b,&l_c2);
+    size_t l_c2a=0, l_c2b=0, l_c2=0;
+    unsigned char *c2a = cat2(PR_ser,33,SIDR2,32,&l_c2a);                           CHECK(c2a);
+    unsigned char *c2b = cat2(PKU_ser,33,T1_buf,16,&l_c2b);                         CHECK(c2b);
+    unsigned char *c2  = cat2(c2a,l_c2a,c2b,l_c2b,&l_c2);                           CHECK(c2);
     unsigned char Cstar_hash[32]; sha256(c2, l_c2, Cstar_hash);
     free(c2a); free(c2b); free(c2);
 
-    BIGNUM *Cstar = NULL; hash_to_bn_mod_n(Cstar_hash, 32, order, &Cstar);
+    CHECK(hash_to_bn_mod_n(Cstar_hash, 32, order, &Cstar));
 
-    // 3) Verify:  σ·g − C*·pk_u  ==?  P_R
-    EC_POINT *sigG  = EC_POINT_new(grp);
-    EC_POINT *CpkU  = EC_POINT_new(grp);
-    EC_POINT *lhs   = EC_POINT_new(grp);
+    sigG  = EC_POINT_new(grp);                                                      CHECK(sigG);
+    CpkU  = EC_POINT_new(grp);                                                      CHECK(CpkU);
+    lhs   = EC_POINT_new(grp);                                                      CHECK(lhs);
 
-    EC_POINT_mul(grp, sigG, sigma, NULL, NULL, bnctx);       // sigG  = σ·G
-    EC_POINT_mul(grp, CpkU, NULL, pk_u, Cstar, bnctx);       // CpkU  = C*·pk_u
-    EC_POINT_invert(grp, CpkU, bnctx);                       // -C*·pk_u
-    EC_POINT_add(grp, lhs, sigG, CpkU, bnctx);               // lhs = σ·G - C*·pk_u
+    CHECK(EC_POINT_mul(grp, sigG, sigma, NULL, NULL, bnctx));        // σ·G
+    CHECK(EC_POINT_mul(grp, CpkU, NULL, pk_R, Cstar, bnctx));  // ✅ ใช้ pk_R // C*·pk_u
+    CHECK(EC_POINT_invert(grp, CpkU, bnctx));                         // -C*·pk_u
+    CHECK(EC_POINT_add(grp, lhs, sigG, CpkU, bnctx));                 // lhs = σ·G - C*·pk_u
 
     if(EC_POINT_cmp(grp, lhs, P_R, bnctx) != 0){
         printf("[Owner] FAIL: ZK proof check did not match PR\n");
         goto cleanup_fail;
     }
 
-    // 4) Session Generation: verify n_R·pk_u == P_R · sk_u  (equivalent check)
-    //    left  = n_R * pk_u
-    //    right = sk_u * P_R
-    EC_POINT *left  = EC_POINT_new(grp);
-    EC_POINT *right = EC_POINT_new(grp);
-    EC_POINT_mul(grp, left, NULL, pk_u, nR, bnctx);     // n_R * pk_u
-    EC_POINT_mul(grp, right, NULL, P_R, sk_u, bnctx);   // sk_u * P_R
-
+    left  = EC_POINT_new(grp);                                                        CHECK(left);
+    right = EC_POINT_new(grp);                                                        CHECK(right);
+    CHECK(EC_POINT_mul(grp, left,  NULL, pk_u, nR, bnctx));         // n_R * pk_u
+    CHECK(EC_POINT_mul(grp, right, NULL, P_R,  sk_u, bnctx));       // sk_u * P_R
     if(EC_POINT_cmp(grp, left, right, bnctx) != 0){
         printf("[Owner] FAIL: session key consistency (nR·pk_u != P_R·sk_u)\n");
         goto cleanup_fail;
     }
 
-    printf("✅ VERIFY/AUDIT PASSED — Session is VALID.\n");
-    print_hex("C:     ", C_hash, 32);
-    print_hex("C*:    ", Cstar_hash, 32);
-    goto cleanup_ok;
+    long long T_vfy1 = now_ms();
+
+    printf("\n=== [Owner Verification Phase] ===\n");
+    print_hex("SID_R2:   ", SIDR2, 32);
+    print_hex("C*_hash:  ", Cstar_hash, 32);
+    print_bn ("C*:       ", Cstar);
+    printf("⏱️ Verify time: %lld ms\n", (T_vfy1 - T_vfy0));
+
+    printf("\n✅ VERIFY/AUDIT PASSED — Session is VALID.\n");
+    print_hex("C:   ", C_hash, 32);
+    print_hex("C*:  ", Cstar_hash, 32);
+    ret = 0;
+    goto cleanup;
 
 cleanup_fail:
-    printf("❌ VERIFY/AUDIT FAILED.\n");
+    // เติมข้อมูลช่วยดีบักเมื่อ fail
+    printf("\n❌ VERIFY/AUDIT FAILED.\n");
+    if(C)     print_bn("C (bn): ", C);
+    if(Cstar) print_bn("C* (bn): ", Cstar);
+    if(nR)    print_bn("n_R: ", nR);
 
-cleanup_ok:
-    // fallthrough
+cleanup:
+    if(P_R)   EC_POINT_free(P_R);
+    if(sigG)  EC_POINT_free(sigG);
+    if(CpkU)  EC_POINT_free(CpkU);
+    if(lhs)   EC_POINT_free(lhs);
+    if(left)  EC_POINT_free(left);
+    if(right) EC_POINT_free(right);
 
-    /* ---- Free resources ---- */
-    EC_POINT_free(P_R);
-    EC_POINT_free(sigG); EC_POINT_free(CpkU); EC_POINT_free(lhs);
-    EC_POINT_free(left); EC_POINT_free(right);
-    BN_free(order); BN_free(nR); BN_free(C); BN_free(Cstar); BN_free(sigma);
-    EC_KEY_free(owner); EC_KEY_free(req);
-    EC_GROUP_free(grp); BN_CTX_free(bnctx);
-    return 0;
+    if(C)     BN_free(C);
+    if(Cstar) BN_free(Cstar);
+    if(sigma) BN_free(sigma);
+    if(nR)    BN_free(nR);
+    if(order) BN_free(order);
+
+    if(owner) EC_KEY_free(owner);
+    if(req)   EC_KEY_free(req);
+    if(grp)   EC_GROUP_free(grp);
+    if(bnctx) BN_CTX_free(bnctx);
+
+    long long T_total1 = now_ms();
+    printf("\n⏱️ Total execution time: %lld ms\n", (T_total1 - T_total0));
+    return ret;
 }
