@@ -191,7 +191,7 @@ int main(void){
     print_hex("C_hash: ", C_hash, 32);
     print_bn("sigma: ", sigma);
     print_hex("P_R (compressed): ", PR_ser, 33);
-    printf("⏱️ Requester time: %lld ms\n", (T_req1 - T_req0));
+    printf(" Requester time: %lld ms\n", (T_req1 - T_req0));
 
     const EC_POINT *pk_R = EC_KEY_get0_public_key(req);
 
@@ -249,7 +249,7 @@ int main(void){
     print_hex("SID_R2:   ", SIDR2, 32);
     print_hex("C*_hash:  ", Cstar_hash, 32);
     print_bn ("C*:       ", Cstar);
-    printf("⏱️ Verify time: %lld ms\n", (T_vfy1 - T_vfy0));
+    printf(" Verify time: %lld ms\n", (T_vfy1 - T_vfy0));
 
     printf("\nVERIFY/AUDIT PASSED — Session is VALID.\n");
     print_hex("C:   ", C_hash, 32);
@@ -258,8 +258,7 @@ int main(void){
     goto cleanup;
 
 cleanup_fail:
-    // เติมข้อมูลช่วยดีบักเมื่อ fail
-    printf("\n❌ VERIFY/AUDIT FAILED.\n");
+    printf("\n VERIFY/AUDIT FAILED.\n");
     if(C)     print_bn("C (bn): ", C);
     if(Cstar) print_bn("C* (bn): ", Cstar);
     if(nR)    print_bn("n_R: ", nR);
