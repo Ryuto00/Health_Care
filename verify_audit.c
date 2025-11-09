@@ -283,6 +283,6 @@ cleanup:
     if(bnctx) BN_CTX_free(bnctx);
 
     long long T_total1 = now_ms();
-    printf("\n⏱️ Total execution time: %lld ms\n", (T_total1 - T_total0));
+    printf("\n Total execution time: %lld ms\n", (T_total1 - T_total0));
     return ret;
 }
