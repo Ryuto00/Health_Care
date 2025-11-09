@@ -251,7 +251,7 @@ int main(void){
     print_bn ("C*:       ", Cstar);
     printf("⏱️ Verify time: %lld ms\n", (T_vfy1 - T_vfy0));
 
-    printf("\n✅ VERIFY/AUDIT PASSED — Session is VALID.\n");
+    printf("\nVERIFY/AUDIT PASSED — Session is VALID.\n");
     print_hex("C:   ", C_hash, 32);
     print_hex("C*:  ", Cstar_hash, 32);
     ret = 0;
