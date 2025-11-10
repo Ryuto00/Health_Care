@@ -77,6 +77,11 @@ Run:
 "4a0335dc0fa4d0c266dfc43ffd27fdc5b388cc14bb896a25097ccd30e05b28aaceee" \
 "a8fcb60f86985516396a1d7ce8b87f600b9053b3c3491eaac11e67a0bb7d77df"
 
+
+Structure:
+ ./decrypt_access "<POLICY>" "<attr1,attr2,...>" <s_hex> <iv_hex> <tag_hex> <ct_hex> <C0_hex>
+
+
 Expected Output:
 === Access / Decrypt Phase ===
 Policy: Doctor AND (Cardiology OR Neurology)
@@ -115,3 +120,24 @@ C*:       9193897BF9CBA8488D275050D9869E74FDB2BA5819F36279984F1394D724DED6
 VERIFY/AUDIT PASSED — Session is VALID.
 C:   394edc010fd606a215d02ff50944cb51df53f515c6dfb3297b1eac90ebd4ba5b
 C*:  394edc010fd606a215d02ff50944cb51df53f515c6dfb3297b1eac90ebd4ba5b
+
+
+Phase 5 — Policy Update / Revocation Benchmark
+
+Compile:
+gcc -O3 policy_update.c -o policy_update \-I/opt/homebrew/opt/openssl/include \
+-L/opt/homebrew/opt/openssl/lib -lcrypto
+
+Run:
+./policy_update "Doctor AND (Cardiology OR Device-1234)" "Device-1234"                   
+
+Expected Output:
+Old Policy: Doctor AND (Cardiology OR Device-1234)
+Revoked Attribute: Device-1234
+Updated Policy: Doctor AND (Cardiology OR            )
+Policy string update time: 0.001 ms
+New AES Key: 46a5f71bb00fe68d6b1a133af2bd6dd85af43b15640e8f30cf85c8bb993f48f2
+IV: 6556f9e44e1630f4cbbd46b3
+Tag: f31bd729915370b954a55408836994b9
+Re-encrypted data length: 30 bytes
+Total Policy Update : 0.010 ms
