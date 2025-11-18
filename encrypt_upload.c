@@ -58,7 +58,7 @@ static void sha256_buf(const unsigned char*in,size_t inl,unsigned char out[32]){
     SHA256(in,inl,out);
 }
 
-/* ------------------- (parser เดิมทั้งหมด) ------------------- */
+/* ------------------- parser ------------------- */
 
 typedef enum { T_WORD, T_AND, T_OR, T_LP, T_RP, T_END } Tok;
 typedef struct { Tok t; char word[128]; } Token;
@@ -111,9 +111,11 @@ static unsigned char* cat2(const unsigned char*a,size_t la,const unsigned char*b
     return m;
 }
 
+/* AES-GCM */
 static int aes_gcm_encrypt(const unsigned char*pt,int ptlen,const unsigned char*key,
                            unsigned char iv[GCM_IV_LEN],unsigned char**out_ct,int*out_ct_len,
                            unsigned char tag[GCM_TAG_LEN]){
+
     RAND_bytes(iv,GCM_IV_LEN);
 
     EVP_CIPHER_CTX*ctx = EVP_CIPHER_CTX_new();
@@ -130,8 +132,8 @@ static int aes_gcm_encrypt(const unsigned char*pt,int ptlen,const unsigned char*
     ok &= EVP_CIPHER_CTX_ctrl(ctx,EVP_CTRL_GCM_GET_TAG,GCM_TAG_LEN,tag);
 
     EVP_CIPHER_CTX_free(ctx);
-
     if(!ok){ free(ct); return 0; }
+
     *out_ct = ct;
     *out_ct_len = ctlen;
     return 1;
@@ -144,14 +146,12 @@ static int point_from_scalar_p256(const BIGNUM*s,unsigned char out33[33]){
     EC_POINT*P   = EC_POINT_new(grp);
 
     if(P && EC_POINT_mul(grp,P,s,NULL,NULL,NULL)){
-        size_t L =
-            EC_POINT_point2oct(grp,P,POINT_CONVERSION_COMPRESSED,out33,33,NULL);
+        size_t L = EC_POINT_point2oct(grp,P,POINT_CONVERSION_COMPRESSED,out33,33,NULL);
         ok = (L == 33);
     }
 
     EC_POINT_free(P);
     EC_GROUP_free(grp);
-
     return ok;
 }
 
@@ -167,10 +167,10 @@ static void lowerize(char*s){
 int main(void){
     double t_global_start = now_ms();
 
-    const char* POLICY = "(role AND sec-team)";
+    const char* POLICY  = "(role AND sec-team)";
     const char* LOG_DIR = "logs";
 
-    /* parse policy ครั้งเดียว */
+    /* Parse policy */
     Lexer Lx={POLICY,0,strlen(POLICY)};
     Token tk; StrList leafs={0};
     unsigned char*canon=NULL; size_t canon_len=0;
@@ -213,7 +213,7 @@ int main(void){
         goto fail;
     }
 
-    mkdir("encrypted", 0755);  // ⭐ NEW: สร้างโฟลเดอร์ถ้ายังไม่มี
+    mkdir("encrypted", 0755);
 
     struct dirent* ent;
     while((ent = readdir(d))){
@@ -256,7 +256,7 @@ int main(void){
         memcpy(C0, K, 32);
         xor32(C0, pair_key);
 
-        /* ------- SAVE .enc FILE ------- */      // ⭐ NEW
+        /* ===== SAVE .enc FILE ===== */
         char enc_out[512];
         snprintf(enc_out,sizeof(enc_out),"encrypted/%s.enc",ent->d_name);
         FILE *fec = fopen(enc_out,"wb");
@@ -265,10 +265,9 @@ int main(void){
             fwrite(tag,1, GCM_TAG_LEN, fec);
             fwrite(ct, 1, ctlen, fec);
             fclose(fec);
-            printf("✔ saved ciphertext → %s\n", enc_out);
         }
 
-        /* ------- SAVE .meta FILE ------- */     // ⭐ NEW
+        /* ===== SAVE .meta FILE (ครบทุกฟิลด์) ===== */
         char meta_out[512];
         snprintf(meta_out,sizeof(meta_out),"encrypted/%s.meta",ent->d_name);
 
@@ -280,6 +279,10 @@ int main(void){
             for(int i=0;i<32;i++) fprintf(fm,"%02x",policy_hash[i]);
             fprintf(fm,"\n");
 
+            fprintf(fm, "s=");
+            for(int i=0;i<32;i++) fprintf(fm,"%02x",s_bytes[i]);
+            fprintf(fm,"\n");
+
             fprintf(fm, "C0=");
             for(int i=0;i<32;i++) fprintf(fm,"%02x",C0[i]);
             fprintf(fm,"\n");
@@ -289,7 +292,6 @@ int main(void){
             fprintf(fm,"\n");
 
             fclose(fm);
-            printf("✔ saved metadata → %s\n", meta_out);
         }
 
         BN_free(s);
@@ -303,7 +305,6 @@ int main(void){
 
     printf("\nALL DONE.\n");
     printf("Total time: %.3f ms\n", now_ms() - t_global_start);
-
     return 0;
 
 fail:
